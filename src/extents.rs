@@ -1,128 +1,266 @@
 use std::collections::HashMap;
+use std::os::fd::AsFd;
 
+use anyhow::{Result, bail};
+
+use crate::btree::*;
 use crate::counters::Counters;
-use crate::fiemap::Mapping;
-use crate::walk::{File, NO_PARENT, Node};
+use crate::walk::{File, NO_PARENT, Node, Walk};
 
-/// A file's reference to a slice of a shared (reflinked) extent.
-///
-/// FIEMAP gives each pointer's offset on its device, not which device: two
-/// different extents can sit at the same offset on different devices. So an
-/// extent is told apart by `sig`, a hash of where its other pointers are
-/// relative to the first - unchanged when a file references only a slice,
-/// which moves every pointer by the same amount. `start` and `len` are the
-/// first pointer's, in sectors.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SharedRef {
-    pub sig:   u64,
+/// An indirect extent, from the reflink btree: data a reflinked file reads
+/// through a reflink_p. It's refcounted as a whole, so it stays allocated -
+/// all of it - while anything references any part of it. In sectors.
+#[derive(Clone, Copy)]
+pub struct Indirect {
     pub start: u64,
-    pub len:   u32,
-    pub file:  u32,
+    pub len: u32,
+    pub inline: bool,
 }
 
-// sig of a slice seen with a single pointer: bcachefs reports only the first
-// pointer of the last mapping of a FIEMAP call, so it isn't known yet
-const SIG_UNRESOLVED: u64 = 0;
-
-fn mix(h: u64, v: u64) -> u64 {
-    let mut h = (h ^ v).wrapping_mul(0xff51afd7ed558ccd);
-    h ^= h >> 33;
-    h = h.wrapping_mul(0xc4ceb9fe1a85ec53);
-    h ^ (h >> 33)
-}
-
-fn nonzero(h: u64) -> u64 {
-    if h == SIG_UNRESOLVED { 1 } else { h }
-}
-
-impl SharedRef {
-    pub fn new(m: &Mapping<'_>, file: u32) -> Self {
-        let first = m.ptrs[0].physical;
-        let sig = if m.ptrs.len() == 1 {
-            SIG_UNRESOLVED
-        } else {
-            nonzero(m.ptrs[1..].iter().fold(mix(0x6263_6475, m.ptrs.len() as u64), |h, p| {
-                mix(h, p.physical.wrapping_sub(first))
-            }))
-        };
-        SharedRef {
-            sig,
-            start: first >> 9,
-            len: u32::try_from(m.length >> 9).expect("an extent of 2^32 sectors"),
-            file,
-        }
-    }
-
+impl Indirect {
     fn end(&self) -> u64 {
         self.start + self.len as u64
     }
 }
 
-/// Gives each single-pointer slice the sig of the extent whose first pointer
-/// it lines up with: the same slice, else one containing it, else one
-/// overlapping it - and only if exactly one extent does, as offsets on
-/// different devices coincide. One without a match is keyed by its own offset
-/// and length, so identical slices still count once.
-pub fn resolve_single_ptr(refs: &mut [SharedRef], c: &mut Counters) {
-    refs.sort_unstable_by_key(|r| r.start);
-    let max_len = refs.iter().filter(|r| r.sig != SIG_UNRESOLVED).map(|r| r.len as u64).max().unwrap_or(0);
-
-    let mut assign = Vec::new();
-    let mut cands: Vec<(u8, u64)> = Vec::new();
-    for (i, r) in refs.iter().enumerate().filter(|(_, r)| r.sig == SIG_UNRESOLVED) {
-        cands.clear();
-        let before = refs[..i].iter().rev().take_while(|o| o.start + max_len > r.start);
-        let after = refs[i + 1..].iter().take_while(|o| o.start < r.end());
-        for o in before.chain(after) {
-            if o.sig == SIG_UNRESOLVED || o.start >= r.end() || o.end() <= r.start {
-                continue;
-            }
-            let fit = if o.start == r.start && o.len == r.len {
-                2
-            } else if o.start <= r.start && o.end() >= r.end() {
-                1
-            } else {
-                0
-            };
-            cands.push((fit, o.sig));
-        }
-        cands.sort_unstable_by(|a, b| b.cmp(a));
-        cands.dedup();
-
-        let sig = match cands[..] {
-            [] => {
-                c.single_ptr_unmatched += 1;
-                c.bytes_single_ptr_unmatched += (r.len as u64) << 9;
-                None
-            }
-            [(best, sig), ref rest @ ..] if rest.first().is_none_or(|&(fit, _)| fit < best) => Some(sig),
+pub fn read_indirect(fd: impl AsFd, c: &mut Counters) -> Result<Vec<Indirect>> {
+    let mut out = Vec::new();
+    for_each_key(fd, BTREE_REFLINK, 0, u64::MAX, |k| {
+        let inline = match k.ty() {
+            KEY_TYPE_REFLINK_V => false,
+            KEY_TYPE_INDIRECT_INLINE_DATA | KEY_TYPE_INDIRECT_INLINE_DATA_V2 => true,
             _ => {
-                c.single_ptr_ambiguous += 1;
-                c.bytes_single_ptr_ambiguous += (r.len as u64) << 9;
-                None
+                c.reflink_other += 1;
+                return Ok(());
             }
         };
-        if sig.is_some() {
-            c.single_ptr_resolved += 1;
+        let e = Indirect {
+            start: k.start(),
+            len: k.size(),
+            inline,
+        };
+        if let Some(prev) = out.last() {
+            if e.start < Indirect::end(prev) {
+                bail!(
+                    "reflink btree: an extent at {}..{} overlaps the one before it",
+                    e.start,
+                    e.end()
+                );
+            }
         }
-        assign.push((i, sig.unwrap_or_else(|| nonzero(mix(mix(0x6c6f6e65, r.start), r.len as u64)))));
-    }
-    for (i, sig) in assign {
-        refs[i].sig = sig;
+        out.push(e);
+        Ok(())
+    })?;
+    c.indirect_extents = out.len() as u64;
+    Ok(out)
+}
+
+pub const OUTSIDE: u32 = u32::MAX;
+
+/// For each indirect extent, the files referencing it: `files[start[i]..start[i + 1]]`.
+/// A file that isn't in the walk is OUTSIDE.
+pub struct Holders {
+    pub start: Vec<u32>,
+    pub files: Vec<u32>,
+}
+
+struct Lookup<'a> {
+    snapshots: &'a HashMap<u32, u64>,
+    files: &'a HashMap<(u64, u64), u32>,
+    last: (u32, u64, u32),
+}
+
+impl Lookup<'_> {
+    fn file(&mut self, snapshot: u32, inode: u64) -> u32 {
+        if (self.last.0, self.last.1) != (snapshot, inode) {
+            let f = self
+                .snapshots
+                .get(&snapshot)
+                .and_then(|&subvol| self.files.get(&(subvol, inode)))
+                .copied()
+                .unwrap_or(OUTSIDE);
+            self.last = (snapshot, inode, f);
+        }
+        self.last.2
     }
 }
 
-/// Bytes of shared extents charged to each folder: `total` once for every
-/// folder some referencing file is under, `exclusive` only where every
-/// referencing file is under it.
+const REFLINK_P_IDX_MASK: u64 = (1 << 56) - 1;
+
+struct ScanPart {
+    direct: Vec<(u32, u64)>,
+    holds: Vec<(u32, u32)>,
+    counters: Counters,
+}
+
+/// Reads the extents btree: each walked file's direct extents into
+/// `files[].direct`, and which indirect extents every file holds.
+/// `snapshots` maps a snapshot id to its subvolume.
+pub fn read_extents(
+    fd: impl AsFd + Sync,
+    w: &mut Walk,
+    snapshots: &HashMap<u32, u64>,
+    indirect: &[Indirect],
+    threads: usize,
+) -> Result<Holders> {
+    let by_inode: HashMap<(u64, u64), u32> = w
+        .files
+        .iter()
+        .enumerate()
+        .map(|(i, f)| ((w.nodes[f.dir as usize].subvol, f.inode), i as u32))
+        .collect();
+
+    // The btree is ordered by inode first: split it between the threads at
+    // inode numbers that divide the walked files evenly.
+    let mut inodes: Vec<u64> = w.files.iter().map(|f| f.inode).collect();
+    inodes.sort_unstable();
+    let mut bounds = vec![0u64];
+    for t in 1..threads {
+        let b = inodes
+            .get(inodes.len() * t / threads)
+            .copied()
+            .unwrap_or(u64::MAX);
+        if b > *bounds.last().unwrap() {
+            bounds.push(b);
+        }
+    }
+
+    let fd = fd.as_fd();
+    let parts: Vec<Result<ScanPart>> = std::thread::scope(|s| {
+        let handles: Vec<_> = bounds
+            .iter()
+            .enumerate()
+            .map(|(i, &lo)| {
+                let hi = bounds.get(i + 1).map_or(u64::MAX, |&b| b - 1);
+                let by_inode = &by_inode;
+                s.spawn(move || {
+                    let mut p = ScanPart {
+                        direct: Vec::new(),
+                        holds: Vec::new(),
+                        counters: Counters::default(),
+                    };
+                    let mut lookup = Lookup {
+                        snapshots,
+                        files: by_inode,
+                        last: (u32::MAX, u64::MAX, OUTSIDE),
+                    };
+                    for_each_key(fd, BTREE_EXTENTS, lo, hi, |k| {
+                        add_key(k, &mut lookup, snapshots, indirect, &mut p)
+                    })?;
+                    Ok(p)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let mut count = vec![0u32; indirect.len() + 1];
+    let mut holds = Vec::new();
+    for p in parts {
+        let p = p?;
+        for (file, bytes) in p.direct {
+            w.files[file as usize].direct += bytes;
+        }
+        for &(extent, _) in &p.holds {
+            count[extent as usize] += 1;
+        }
+        holds.push(p.holds);
+        w.counters += &p.counters;
+    }
+
+    // a counting sort, by extent
+    let mut start = Vec::with_capacity(count.len());
+    let mut sum = 0u32;
+    for n in &count {
+        start.push(sum);
+        sum = sum
+            .checked_add(*n)
+            .expect("more than 2^32 references to indirect extents");
+    }
+    let mut next = start.clone();
+    let mut files = vec![0u32; sum as usize];
+    for (extent, file) in holds.into_iter().flatten() {
+        files[next[extent as usize] as usize] = file;
+        next[extent as usize] += 1;
+    }
+    Ok(Holders { start, files })
+}
+
+fn add_key(
+    k: &Key<'_>,
+    lookup: &mut Lookup<'_>,
+    snapshots: &HashMap<u32, u64>,
+    indirect: &[Indirect],
+    p: &mut ScanPart,
+) -> Result<()> {
+    let c = &mut p.counters;
+    let bytes = (k.size() as u64) << 9;
+    let file = lookup.file(k.snapshot(), k.inode());
+    if file == OUTSIDE && !snapshots.contains_key(&k.snapshot()) {
+        c.keys_unmapped_snapshot += 1;
+    }
+
+    match k.ty() {
+        KEY_TYPE_EXTENT => {
+            c.extents_direct += 1;
+            if file == OUTSIDE {
+                c.bytes_outside_direct += bytes;
+            } else if let Some(last) = p.direct.last_mut().filter(|d| d.0 == file) {
+                last.1 += bytes;
+            } else {
+                p.direct.push((file, bytes));
+            }
+        }
+        KEY_TYPE_REFLINK_P => {
+            c.extents_reflinked += 1;
+            let v = k.val();
+            if v.len() < 16 {
+                bail!(
+                    "extents btree: a reflink_p of {} value bytes at {}:{}",
+                    v.len(),
+                    k.inode(),
+                    k.offset()
+                );
+            }
+            let idx = u64::from_le_bytes(v[0..8].try_into().unwrap()) & REFLINK_P_IDX_MASK;
+            let front_pad = u32::from_le_bytes(v[8..12].try_into().unwrap()) as u64;
+            let back_pad = u32::from_le_bytes(v[12..16].try_into().unwrap()) as u64;
+            // the pads are what it holds a reference on beyond what it reads
+            let lo = idx.saturating_sub(front_pad);
+            let hi = idx + k.size() as u64 + back_pad;
+
+            let first = indirect.partition_point(|e| e.end() <= lo);
+            let held = indirect[first..]
+                .iter()
+                .take_while(|e| e.start < hi)
+                .count();
+            if held == 0 {
+                c.refs_dangling += 1;
+            }
+            p.holds
+                .extend((first..first + held).map(|e| (e as u32, file)));
+        }
+        KEY_TYPE_RESERVATION => c.bytes_reserved += bytes,
+        KEY_TYPE_INLINE_DATA | KEY_TYPE_INLINE_DATA_V2 => c.bytes_inline += bytes,
+        _ => c.extents_other += 1,
+    }
+    Ok(())
+}
+
+/// Bytes charged to each folder: `total` once for every folder some file
+/// reading the data is under, `exclusive` only where every such file is.
 pub struct Attribution {
-    pub total:     Vec<u64>,
+    pub total: Vec<u64>,
     pub exclusive: Vec<u64>,
+    /// Indirect extents only files outside the walk reference.
+    pub outside_only: u64,
+    /// Indirect extents nothing references.
+    pub unreferenced: u64,
 }
 
 struct Tree {
     parent: Vec<u32>,
-    depth:  Vec<u32>,
+    depth: Vec<u32>,
 }
 
 impl Tree {
@@ -142,37 +280,31 @@ impl Tree {
 }
 
 struct Sweep<'a> {
-    tree:   &'a Tree,
-    files:  &'a [File],
-    links:  &'a HashMap<u32, Vec<u32>>,
-    att:    Attribution,
-    stamp:  Vec<u32>,
-    epoch:  u32,
-    events: Vec<(u64, bool, u32)>,
-    active: Vec<u32>,
-    dirs:   Vec<u32>,
+    tree: &'a Tree,
+    files: &'a [File],
+    links: &'a HashMap<u32, Vec<u32>>,
+    att: Attribution,
+    stamp: Vec<u32>,
+    epoch: u32,
+    dirs: Vec<u32>,
 }
 
 impl<'a> Sweep<'a> {
-    fn new(tree: &'a Tree, files: &'a [File], links: &'a HashMap<u32, Vec<u32>>, nodes: usize) -> Self {
+    fn new(tree: &'a Tree, files: &'a [File], links: &'a HashMap<u32, Vec<u32>>) -> Self {
+        let n = tree.parent.len();
         Sweep {
             tree,
             files,
             links,
-            att: Attribution { total: vec![0; nodes], exclusive: vec![0; nodes] },
-            stamp: vec![0; nodes],
+            att: Attribution {
+                total: vec![0; n],
+                exclusive: vec![0; n],
+                outside_only: 0,
+                unreferenced: 0,
+            },
+            stamp: vec![0; n],
             epoch: 0,
-            events: Vec::new(),
-            active: Vec::new(),
             dirs: Vec::new(),
-        }
-    }
-
-    fn charge_one(&mut self, mut n: u32, bytes: u64) {
-        while n != NO_PARENT {
-            self.att.total[n as usize] += bytes;
-            self.att.exclusive[n as usize] += bytes;
-            n = self.tree.parent[n as usize];
         }
     }
 
@@ -183,14 +315,11 @@ impl<'a> Sweep<'a> {
         }
     }
 
-    // self.dirs: the folders of the files referencing one stretch of an extent
-    fn charge(&mut self, bytes: u64) {
+    // self.dirs: the folders of the files reading some data; `outside`: a file
+    // outside the walk reads it too
+    fn charge(&mut self, bytes: u64, outside: bool) {
         self.dirs.sort_unstable();
         self.dirs.dedup();
-        if let [dir] = self.dirs[..] {
-            self.charge_one(dir, bytes);
-            return;
-        }
 
         self.epoch = self.epoch.wrapping_add(1);
         if self.epoch == 0 {
@@ -206,7 +335,12 @@ impl<'a> Sweep<'a> {
             }
         }
 
-        let mut n = self.dirs[1..].iter().fold(self.dirs[0], |a, &b| self.tree.lca(a, b));
+        if outside {
+            return;
+        }
+        let mut n = self.dirs[1..]
+            .iter()
+            .fold(self.dirs[0], |a, &b| self.tree.lca(a, b));
         while n != NO_PARENT {
             debug_assert_eq!(self.stamp[n as usize], self.epoch);
             self.att.exclusive[n as usize] += bytes;
@@ -214,84 +348,57 @@ impl<'a> Sweep<'a> {
         }
     }
 
-    // refs: one extent's slices, sorted by start
-    fn extent(&mut self, refs: &[SharedRef]) {
-        if let [r] = refs {
-            self.dirs.clear();
-            self.add_file_dirs(r.file);
-            self.charge((r.len as u64) << 9);
+    fn extent(&mut self, e: &Indirect, holders: &[u32]) {
+        let bytes = (e.len as u64) << 9;
+        if holders.is_empty() {
+            self.att.unreferenced += bytes;
             return;
         }
-
-        self.events.clear();
-        for r in refs {
-            self.events.push((r.start, true, r.file));
-            self.events.push((r.end(), false, r.file));
-        }
-        // ends before starts at the same offset: touching slices don't overlap
-        self.events.sort_unstable_by_key(|&(pos, start, _)| (pos, start));
-
-        self.active.clear();
-        let mut prev = self.events[0].0;
-        for i in 0..self.events.len() {
-            let (pos, start, file) = self.events[i];
-            if pos > prev && !self.active.is_empty() {
-                self.dirs.clear();
-                for j in 0..self.active.len() {
-                    self.add_file_dirs(self.active[j]);
-                }
-                self.charge((pos - prev) << 9);
-            }
-            prev = pos;
-            if start {
-                self.active.push(file);
+        self.dirs.clear();
+        let mut outside = false;
+        for &f in holders {
+            if f == OUTSIDE {
+                outside = true;
             } else {
-                let i = self.active.iter().position(|&f| f == file).expect("a slice ended that never started");
-                self.active.swap_remove(i);
+                self.add_file_dirs(f);
             }
         }
-        assert!(self.active.is_empty(), "slices still open at the end of an extent");
+        if self.dirs.is_empty() {
+            self.att.outside_only += bytes;
+        } else {
+            self.charge(bytes, outside);
+        }
     }
 }
 
-/// `refs` must be sorted by (sig, start). A hardlinked file's direct extents
-/// are charged here too, as they're shared between its folders.
+/// Charges the indirect extents to the folders of the files holding them, and
+/// a hardlinked file's direct extents to each folder it has a name in.
+/// Inline indirect extents are btree metadata, not user data, and skipped.
 pub fn attribute(
-    refs: &[SharedRef],
-    files: &[File],
-    links: &HashMap<u32, Vec<u32>>,
-    nodes: &[Node],
+    w: &Walk,
+    indirect: &[Indirect],
+    holders: &Holders,
     threads: usize,
 ) -> Attribution {
     let tree = Tree {
-        parent: nodes.iter().map(|n| n.parent).collect(),
-        depth:  nodes.iter().map(|n| n.depth).collect(),
+        parent: w.nodes.iter().map(|n: &Node| n.parent).collect(),
+        depth: w.nodes.iter().map(|n| n.depth).collect(),
     };
-    debug_assert!(refs.windows(2).all(|w| (w[0].sig, w[0].start) <= (w[1].sig, w[1].start)));
-
-    // chunks end on extent boundaries
-    let mut bounds = vec![0];
-    let step = refs.len().div_ceil(threads.max(1)).max(1);
-    while let Some(&last) = bounds.last() {
-        if last >= refs.len() {
-            break;
-        }
-        let mut end = (last + step).min(refs.len());
-        while end < refs.len() && refs[end].sig == refs[end - 1].sig {
-            end += 1;
-        }
-        bounds.push(end);
-    }
+    let chunk = indirect.len().div_ceil(threads.max(1)).max(1);
 
     let parts: Vec<Attribution> = std::thread::scope(|s| {
-        let handles: Vec<_> = bounds
-            .windows(2)
-            .map(|w| {
-                let (refs, tree) = (&refs[w[0]..w[1]], &tree);
+        let handles: Vec<_> = (0..indirect.len())
+            .step_by(chunk)
+            .map(|lo| {
+                let tree = &tree;
                 s.spawn(move || {
-                    let mut sw = Sweep::new(tree, files, links, nodes.len());
-                    for extent in refs.chunk_by(|a, b| a.sig == b.sig) {
-                        sw.extent(extent);
+                    let mut sw = Sweep::new(tree, &w.files, &w.links);
+                    let end = (lo + chunk).min(indirect.len());
+                    let starts = holders.start[lo..=end].windows(2);
+                    for (e, s) in indirect[lo..end].iter().zip(starts) {
+                        if !e.inline {
+                            sw.extent(e, &holders.files[s[0] as usize..s[1] as usize]);
+                        }
                     }
                     sw.att
                 })
@@ -300,11 +407,11 @@ pub fn attribute(
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    let mut sw = Sweep::new(&tree, files, links, nodes.len());
-    for &file in links.keys() {
+    let mut sw = Sweep::new(&tree, &w.files, &w.links);
+    for &file in w.links.keys() {
         sw.dirs.clear();
         sw.add_file_dirs(file);
-        sw.charge(files[file as usize].direct);
+        sw.charge(w.files[file as usize].direct, false);
     }
     let mut att = sw.att;
     for p in parts {
@@ -314,6 +421,8 @@ pub fn attribute(
         for (a, b) in att.exclusive.iter_mut().zip(p.exclusive) {
             *a += b;
         }
+        att.outside_only += p.outside_only;
+        att.unreferenced += p.unreferenced;
     }
     att
 }
@@ -326,93 +435,112 @@ mod tests {
 
     // root 0 ─┬─ a 1 ─── a/x 3
     //         └─ b 2
-    fn nodes() -> Vec<Node> {
-        let n = |parent, depth| Node { name: OsString::new(), parent, depth, subvol: 0 };
-        vec![n(NO_PARENT, 0), n(0, 1), n(0, 1), n(1, 2)]
+    fn walk(files: &[u32], links: &[(u32, u32)]) -> Walk {
+        let n = |parent, depth| Node {
+            name: OsString::new(),
+            parent,
+            depth,
+            subvol: 0,
+        };
+        let mut l: HashMap<u32, Vec<u32>> = HashMap::new();
+        for &(f, d) in links {
+            l.entry(f).or_default().push(d);
+        }
+        Walk {
+            nodes: vec![n(NO_PARENT, 0), n(0, 1), n(0, 1), n(1, 2)],
+            files: files
+                .iter()
+                .map(|&dir| File {
+                    dir,
+                    inode: 0,
+                    apparent: 0,
+                    direct: 8 << 9,
+                })
+                .collect(),
+            links: l,
+            counters: Counters::default(),
+        }
     }
 
-    fn file(dir: u32) -> File {
-        File { dir, apparent: 0, direct: 0 }
+    fn extents(n: usize) -> Vec<Indirect> {
+        (0..n as u64)
+            .map(|i| Indirect {
+                start: i * 100,
+                len: 10,
+                inline: false,
+            })
+            .collect()
     }
 
-    fn r(sig: u64, start: u64, len: u32, file: u32) -> SharedRef {
-        SharedRef { sig, start, len, file }
+    fn holders(per_extent: &[&[u32]]) -> Holders {
+        let mut start = vec![0];
+        let mut files = Vec::new();
+        for h in per_extent {
+            files.extend_from_slice(h);
+            start.push(files.len() as u32);
+        }
+        Holders { start, files }
     }
 
-    fn run(mut refs: Vec<SharedRef>, files: &[File], threads: usize) -> (Vec<u64>, Vec<u64>) {
-        refs.sort_unstable_by_key(|r| (r.sig, r.start));
-        let att = attribute(&refs, files, &HashMap::new(), &nodes(), threads);
-        let s = |v: Vec<u64>| v.into_iter().map(|b| b / 512).collect();
-        (s(att.total), s(att.exclusive))
+    fn sectors(v: &[u64]) -> Vec<u64> {
+        v.iter().map(|b| b / 512).collect()
     }
 
     #[test]
-    fn one_extent_in_two_folders_is_shared_by_both() {
-        let files = [file(1), file(2)];
-        let (total, excl) = run(vec![r(7, 100, 10, 0), r(7, 100, 10, 1)], &files, 1);
-        assert_eq!(total, [10, 10, 10, 0]);
-        assert_eq!(excl, [10, 0, 0, 0]);
-    }
-
-    #[test]
-    fn overlapping_slices_split_into_stretches() {
-        // a/x has 100..110, b has 105..120: 105..110 is shared
-        let files = [file(3), file(2)];
-        let (total, excl) = run(vec![r(7, 100, 10, 0), r(7, 105, 15, 1)], &files, 1);
-        assert_eq!(total, [20, 10, 15, 10]);
-        assert_eq!(excl, [20, 5, 10, 5]);
-    }
-
-    #[test]
-    fn same_offset_different_sig_is_a_different_extent() {
-        let files = [file(1), file(2)];
-        let (total, excl) = run(vec![r(7, 100, 10, 0), r(8, 100, 10, 1)], &files, 1);
-        assert_eq!(total, [20, 10, 10, 0]);
-        assert_eq!(excl, [20, 10, 10, 0]);
+    fn extent_held_from_two_folders_is_shared_by_both() {
+        let w = walk(&[1, 2], &[]);
+        let att = attribute(&w, &extents(1), &holders(&[&[0, 1]]), 1);
+        assert_eq!(sectors(&att.total), [10, 10, 10, 0]);
+        assert_eq!(sectors(&att.exclusive), [10, 0, 0, 0]);
     }
 
     #[test]
     fn nested_folders_share_within_their_parent() {
-        let files = [file(1), file(3)];
-        let (total, excl) = run(vec![r(7, 0, 8, 0), r(7, 0, 8, 1)], &files, 1);
-        assert_eq!(total, [8, 8, 0, 8]);
-        assert_eq!(excl, [8, 8, 0, 0]);
+        let w = walk(&[1, 3], &[]);
+        let att = attribute(&w, &extents(1), &holders(&[&[0, 1, 1]]), 1);
+        assert_eq!(sectors(&att.total), [10, 10, 0, 10]);
+        assert_eq!(sectors(&att.exclusive), [10, 10, 0, 0]);
+    }
+
+    #[test]
+    fn held_from_outside_is_never_exclusive() {
+        let w = walk(&[3], &[]);
+        let att = attribute(&w, &extents(2), &holders(&[&[0, OUTSIDE], &[OUTSIDE]]), 1);
+        assert_eq!(sectors(&att.total), [10, 10, 0, 10]);
+        assert_eq!(sectors(&att.exclusive), [0, 0, 0, 0]);
+        assert_eq!(att.outside_only / 512, 10);
+    }
+
+    #[test]
+    fn unreferenced_and_inline_extents() {
+        let w = walk(&[1], &[]);
+        let mut ext = extents(3);
+        ext[2].inline = true;
+        let att = attribute(&w, &ext, &holders(&[&[0], &[], &[0]]), 1);
+        assert_eq!(sectors(&att.total), [10, 10, 0, 0]);
+        assert_eq!(att.unreferenced / 512, 10);
+    }
+
+    #[test]
+    fn hardlinked_file_is_shared_by_its_folders() {
+        let w = walk(&[1], &[(0, 2)]);
+        let att = attribute(&w, &extents(1), &holders(&[&[0]]), 1);
+        assert_eq!(sectors(&att.total), [18, 18, 18, 0]);
+        assert_eq!(sectors(&att.exclusive), [18, 0, 0, 0]);
     }
 
     #[test]
     fn threads_agree() {
-        let files = [file(1), file(2), file(3)];
-        let refs: Vec<_> = (0..300)
-            .flat_map(|i| [r(i % 37 + 1, i * 3, 5, (i % 3) as u32), r(i % 37 + 1, i * 3 + 2, 4, ((i + 1) % 3) as u32)])
+        let w = walk(&[1, 2, 3], &[(1, 3)]);
+        let per: Vec<Vec<u32>> = (0..500u32)
+            .map(|i| (0..i % 4).map(|j| (i + j) % 3).collect())
             .collect();
-        assert_eq!(run(refs.clone(), &files, 1), run(refs, &files, 7));
-    }
-
-    #[test]
-    fn single_pointer_slice_takes_the_extent_it_overlaps() {
-        let mut c = Counters::default();
-        let mut refs = vec![r(7, 100, 10, 0), r(SIG_UNRESOLVED, 104, 6, 1), r(SIG_UNRESOLVED, 500, 6, 2)];
-        resolve_single_ptr(&mut refs, &mut c);
-        refs.sort_unstable_by_key(|r| r.start);
-        assert_eq!(refs[1].sig, 7);
-        assert_ne!(refs[2].sig, SIG_UNRESOLVED);
-        assert_eq!((c.single_ptr_resolved, c.single_ptr_unmatched, c.single_ptr_ambiguous), (1, 1, 0));
-    }
-
-    #[test]
-    fn single_pointer_slice_prefers_the_extent_containing_it() {
-        let mut c = Counters::default();
-        let mut refs = vec![r(7, 100, 10, 0), r(8, 104, 3, 1), r(SIG_UNRESOLVED, 101, 4, 2)];
-        resolve_single_ptr(&mut refs, &mut c);
-        assert_eq!(refs.iter().find(|r| r.file == 2).unwrap().sig, 7);
-        assert_eq!(c.single_ptr_resolved, 1);
-    }
-
-    #[test]
-    fn single_pointer_slice_over_two_extents_is_ambiguous() {
-        let mut c = Counters::default();
-        let mut refs = vec![r(7, 100, 10, 0), r(8, 105, 10, 1), r(SIG_UNRESOLVED, 106, 2, 2)];
-        resolve_single_ptr(&mut refs, &mut c);
-        assert_eq!(c.single_ptr_ambiguous, 1);
+        let per: Vec<&[u32]> = per.iter().map(|v| &v[..]).collect();
+        let (e, h) = (extents(500), holders(&per));
+        let (a, b) = (attribute(&w, &e, &h, 1), attribute(&w, &e, &h, 7));
+        assert_eq!(
+            (a.total, a.exclusive, a.unreferenced),
+            (b.total, b.exclusive, b.unreferenced)
+        );
     }
 }

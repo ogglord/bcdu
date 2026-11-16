@@ -5,6 +5,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use rustix::io::Errno;
 use rustix::ioctl::{Opcode, opcode};
 
+use crate::btree::for_each_packed_key;
 use crate::ioctl::ioctl_buf;
 
 const BCACHEFS_SUPER_MAGIC: u64 = 0xca451a4e;
@@ -16,10 +17,10 @@ pub fn is_bcachefs(fd: impl AsFd) -> Result<bool> {
 #[repr(C)]
 #[derive(Default)]
 struct QueryAccounting {
-    capacity:              u64,
-    used:                  u64,
-    online_reserved:       u64,
-    accounting_u64s:       u32,
+    capacity: u64,
+    used: u64,
+    online_reserved: u64,
+    accounting_u64s: u32,
     accounting_types_mask: u32,
 }
 
@@ -28,10 +29,6 @@ const BCH_IOCTL_QUERY_ACCOUNTING: Opcode = opcode::write::<QueryAccounting>(0xbc
 const DISK_ACCOUNTING_REPLICAS: u8 = 2;
 const DATA_TYPE_USER: u8 = 4;
 
-// struct bkey: u64s, format, type, pad, bversion (12), size (4), then the
-// 20 byte bpos an accounting key's position is overlaid on
-const BKEY_U64S: usize = 5;
-const BPOS_OFFSET: usize = 20;
 const BPOS_BYTES: usize = 20;
 
 /// User data by how many devices hold it: the sectors bcachefs has written
@@ -46,7 +43,11 @@ impl UserData {
     }
 
     pub fn one_copy_bytes(&self) -> u64 {
-        self.by_nr_devs.iter().map(|(&nr, &s)| s / nr as u64).sum::<u64>() << 9
+        self.by_nr_devs
+            .iter()
+            .map(|(&nr, &s)| s / nr as u64)
+            .sum::<u64>()
+            << 9
     }
 
     /// The device count, when all user data has the same.
@@ -106,19 +107,24 @@ pub fn user_data(fd: impl AsFd) -> Result<UserData> {
     };
 
     let mut by_nr_devs = BTreeMap::new();
-    let mut keys = &reply[..];
-    while let Some(&first) = keys.first() {
-        let u64s = (first & 0xff) as usize;
-        if u64s < BKEY_U64S + 1 || u64s > keys.len() {
-            bail!("QUERY_ACCOUNTING reply: a key of {u64s} u64s with {} left", keys.len());
+    let mut undecoded = None;
+    let bytes = unsafe { std::slice::from_raw_parts(reply.as_ptr().cast::<u8>(), reply.len() * 8) };
+    for_each_packed_key(bytes, "QUERY_ACCOUNTING reply", |k| {
+        let sectors = k
+            .val()
+            .get(..8)
+            .map(|v| u64::from_le_bytes(v.try_into().unwrap()));
+        match (decode_replicas(k.pos_bytes()), sectors) {
+            (Some((DATA_TYPE_USER, nr_devs)), Some(sectors)) => {
+                *by_nr_devs.entry(nr_devs).or_insert(0) += sectors
+            }
+            (Some(_), Some(_)) => {}
+            _ => undecoded = Some(k.raw.to_vec()),
         }
-        let bytes: Vec<u8> = keys[..BKEY_U64S].iter().flat_map(|w| w.to_ne_bytes()).collect();
-        let (data_type, nr_devs) = decode_replicas(&bytes[BPOS_OFFSET..BPOS_OFFSET + BPOS_BYTES])
-            .ok_or_else(|| anyhow!("QUERY_ACCOUNTING reply: a replicas key that doesn't decode: {bytes:02x?}"))?;
-        if data_type == DATA_TYPE_USER {
-            *by_nr_devs.entry(nr_devs).or_insert(0) += keys[BKEY_U64S];
-        }
-        keys = &keys[u64s..];
+        Ok(())
+    })?;
+    if let Some(raw) = undecoded {
+        bail!("QUERY_ACCOUNTING reply: a replicas key that doesn't decode: {raw:02x?}");
     }
     Ok(UserData { by_nr_devs })
 }
@@ -126,32 +132,38 @@ pub fn user_data(fd: impl AsFd) -> Result<UserData> {
 #[repr(C)]
 #[derive(Default)]
 struct SnapshotTreeQuery {
-    tree_id:       u32,
+    tree_id: u32,
     master_subvol: u32,
     root_snapshot: u32,
-    nr:            u32,
-    total:         u32,
-    pad:           u32,
+    nr: u32,
+    total: u32,
+    pad: u32,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct SnapshotNode {
-    id:       u32,
-    parent:   u32,
+    id: u32,
+    parent: u32,
     children: [u32; 2],
-    subvol:   u32,
-    flags:    u32,
-    pad:      [u32; 2],
-    sectors:  u64,
+    subvol: u32,
+    flags: u32,
+    pad: [u32; 2],
+    sectors: u64,
 }
 
 const BCH_IOCTL_SNAPSHOT_TREE: Opcode = opcode::read_write::<SnapshotTreeQuery>(0xbc, 33);
 
-/// The sectors bcachefs accounts to a subvolume (all replicas), summed up its
-/// snapshot's ancestors as `bcachefs subvolume list` does. Extents that were
-/// ever reflinked aren't in it: those belong to no snapshot.
-pub fn subvol_sectors(fd: impl AsFd, subvol: u64) -> Result<u64> {
+pub struct SubvolSnapshot {
+    pub id: u32,
+    /// What bcachefs accounts to the subvolume (all replicas), summed up its
+    /// snapshot's ancestors as `bcachefs subvolume list` does. Extents that
+    /// were ever reflinked aren't in it: those belong to no snapshot.
+    pub sectors: u64,
+}
+
+/// `fd` is a directory in the subvolume.
+pub fn subvol_snapshot(fd: impl AsFd, subvol: u64) -> Result<SubvolSnapshot> {
     let fd = fd.as_fd();
     let mut cap = 16usize;
     let nodes = loop {
@@ -162,7 +174,10 @@ pub fn subvol_sectors(fd: impl AsFd, subvol: u64) -> Result<u64> {
         match unsafe { ioctl_buf::<BCH_IOCTL_SNAPSHOT_TREE, _>(fd, head) } {
             Ok(()) => {
                 let nr = unsafe { (*head).nr } as usize;
-                assert!(nr <= cap, "SNAPSHOT_TREE returned {nr} nodes into room for {cap}");
+                assert!(
+                    nr <= cap,
+                    "SNAPSHOT_TREE returned {nr} nodes into room for {cap}"
+                );
                 let first = unsafe { head.add(1).cast::<SnapshotNode>() };
                 break unsafe { std::slice::from_raw_parts(first, nr) }.to_vec();
             }
@@ -179,7 +194,12 @@ pub fn subvol_sectors(fd: impl AsFd, subvol: u64) -> Result<u64> {
     let mut cur = Some(leaf);
     while let Some(n) = cur {
         sectors += n.sectors;
-        cur = (n.parent != 0).then(|| nodes.iter().find(|p| p.id == n.parent)).flatten();
+        cur = (n.parent != 0)
+            .then(|| nodes.iter().find(|p| p.id == n.parent))
+            .flatten();
     }
-    Ok(sectors)
+    Ok(SubvolSnapshot {
+        id: leaf.id,
+        sectors,
+    })
 }

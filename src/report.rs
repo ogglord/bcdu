@@ -10,60 +10,65 @@ use crate::walk::{NO_PARENT, Walk};
 
 #[derive(Serialize)]
 pub struct Folder {
-    pub path:      PathBuf,
-    pub depth:     u32,
+    pub path: PathBuf,
+    pub depth: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subvolume: Option<u64>,
-    pub files:     u64,
-    pub total:     u64,
+    pub files: u64,
+    pub total: u64,
     pub exclusive: u64,
-    pub shared:    u64,
-    pub apparent:  u64,
+    pub shared: u64,
+    pub apparent: u64,
 }
 
+/// Where bcachefs's user data is: in the walked files, in files outside the
+/// walk, or in indirect extents nothing references. Whatever's left is
+/// unexplained - compressed extents count at their uncompressed size here.
 #[derive(Serialize)]
 pub struct Filesystem {
     pub user_data_one_copy: u64,
-    pub user_data_raw:      u64,
-    pub replicas:           Option<u8>,
-    pub walked_from_root:   bool,
-    pub found:              u64,
+    pub user_data_raw: u64,
+    pub replicas: Option<u8>,
+    pub walked: u64,
+    pub outside_walk: u64,
+    pub unreferenced: u64,
+    pub unexplained: i64,
 }
 
 #[derive(Serialize)]
 pub struct Check {
-    pub subvolume:        u64,
-    pub path:             PathBuf,
-    pub bcachefs_bytes:   u64,
-    pub bcdu_direct:      u64,
-    pub matches:          bool,
+    pub subvolume: u64,
+    pub path: PathBuf,
+    pub bcachefs_bytes: u64,
+    pub bcdu_direct: u64,
+    pub matches: bool,
 }
 
 #[derive(Serialize)]
 pub struct Report {
-    pub folders:    Vec<Folder>,
+    pub folders: Vec<Folder>,
     pub filesystem: Option<Filesystem>,
-    pub check:      Option<Vec<Check>>,
-    pub counters:   Counters,
+    pub check: Option<Vec<Check>>,
+    pub counters: Counters,
 }
 
 pub struct Usage {
-    pub direct:    Vec<u64>,
-    pub total:     Vec<u64>,
+    pub direct: Vec<u64>,
+    pub total: Vec<u64>,
     pub exclusive: Vec<u64>,
-    pub apparent:  Vec<u64>,
-    pub files:     Vec<u64>,
+    pub apparent: Vec<u64>,
+    pub files: Vec<u64>,
 }
 
 impl Usage {
     pub fn new(w: &Walk, att: &Attribution) -> Self {
         let n = w.nodes.len();
         let mut u = Usage {
-            direct:    vec![0; n],
-            total:     vec![0; n],
+            direct: vec![0; n],
+            total: vec![0; n],
             exclusive: vec![0; n],
-            apparent:  vec![0; n],
-            files:     vec![0; n],
+            apparent: vec![0; n],
+            files: vec![0; n],
         };
         // a hardlinked file's extents are charged to its folders by
         // attribute(); its size goes to each folder it has a name in, below
@@ -97,7 +102,12 @@ impl Usage {
         for i in 0..n {
             u.total[i] = u.direct[i] + att.total[i];
             u.exclusive[i] = u.direct[i] + att.exclusive[i];
-            assert!(u.exclusive[i] <= u.total[i], "node {i}: exclusive {} > total {}", u.exclusive[i], u.total[i]);
+            assert!(
+                u.exclusive[i] <= u.total[i],
+                "node {i}: exclusive {} > total {}",
+                u.exclusive[i],
+                u.total[i]
+            );
         }
         u
     }
@@ -116,7 +126,8 @@ pub fn node_path(w: &Walk, mut n: u32) -> PathBuf {
 
 pub fn is_subvol_root(w: &Walk, n: u32) -> bool {
     let node = &w.nodes[n as usize];
-    node.subvol != 0 && (node.parent == NO_PARENT || w.nodes[node.parent as usize].subvol != node.subvol)
+    node.subvol != 0
+        && (node.parent == NO_PARENT || w.nodes[node.parent as usize].subvol != node.subvol)
 }
 
 /// The tree to `max_depth`, biggest first among siblings.
@@ -136,14 +147,14 @@ pub fn folders(w: &Walk, u: &Usage, max_depth: u32) -> Vec<Folder> {
     while let Some(n) = stack.pop() {
         let i = n as usize;
         out.push(Folder {
-            path:      node_path(w, n),
-            depth:     w.nodes[i].depth,
+            path: node_path(w, n),
+            depth: w.nodes[i].depth,
             subvolume: is_subvol_root(w, n).then_some(w.nodes[i].subvol),
-            files:     u.files[i],
-            total:     u.total[i],
+            files: u.files[i],
+            total: u.total[i],
             exclusive: u.exclusive[i],
-            shared:    u.total[i] - u.exclusive[i],
-            apparent:  u.apparent[i],
+            shared: u.total[i] - u.exclusive[i],
+            apparent: u.apparent[i],
         });
         stack.extend(children[i].iter().rev());
     }
@@ -182,12 +193,24 @@ pub fn report_to_text(out: &mut String, r: &Report, root: &Path, human: bool, ve
         .folders
         .iter()
         .map(|f| {
-            [bytes(f.total, human), bytes(f.exclusive, human), bytes(f.shared, human), bytes(f.apparent, human)]
+            [
+                bytes(f.total, human),
+                bytes(f.exclusive, human),
+                bytes(f.shared, human),
+                bytes(f.apparent, human),
+            ]
         })
         .collect();
     let header = ["total", "exclusive", "shared", "apparent"];
-    let width: Vec<usize> =
-        (0..4).map(|c| rows.iter().map(|r| r[c].len()).chain([header[c].len()]).max().unwrap()).collect();
+    let width: Vec<usize> = (0..4)
+        .map(|c| {
+            rows.iter()
+                .map(|r| r[c].len())
+                .chain([header[c].len()])
+                .max()
+                .unwrap()
+        })
+        .collect();
 
     for (c, h) in header.iter().enumerate() {
         write!(out, "{h:>w$}  ", w = width[c]).unwrap();
@@ -197,8 +220,19 @@ pub fn report_to_text(out: &mut String, r: &Report, root: &Path, human: bool, ve
         for (c, v) in row.iter().enumerate() {
             write!(out, "{v:>w$}  ", w = width[c]).unwrap();
         }
-        let name = if f.depth == 0 { f.path.as_path() } else { f.path.strip_prefix(root).unwrap_or(&f.path) };
-        write!(out, "{:indent$}{}", "", name.display(), indent = 2 * f.depth as usize).unwrap();
+        let name = if f.depth == 0 {
+            f.path.as_path()
+        } else {
+            f.path.strip_prefix(root).unwrap_or(&f.path)
+        };
+        write!(
+            out,
+            "{:indent$}{}",
+            "",
+            name.display(),
+            indent = 2 * f.depth as usize
+        )
+        .unwrap();
         if let Some(s) = f.subvolume {
             write!(out, "  [subvolume {s}]").unwrap();
         }
@@ -208,19 +242,25 @@ pub fn report_to_text(out: &mut String, r: &Report, root: &Path, human: bool, ve
     if let Some(fs) = &r.filesystem {
         writeln!(out).unwrap();
         let label = |out: &mut String, l: &str, b: u64| {
-            writeln!(out, "{l:<36} {}", bytes(b, human)).unwrap();
+            writeln!(out, "{l:<40} {}", bytes(b, human)).unwrap();
         };
         label(out, "bcachefs user data, one copy:", fs.user_data_one_copy);
-        if fs.walked_from_root {
-            label(out, "  found by this walk:", fs.found);
-            let missing = fs.user_data_one_copy.saturating_sub(fs.found);
-            write!(out, "{:<36} {}", "  referenced by no file:", bytes(missing, human)).unwrap();
-            if fs.user_data_one_copy > 0 {
-                write!(out, " ({:.2}%)", 100.0 * missing as f64 / fs.user_data_one_copy as f64).unwrap();
-            }
-            writeln!(out).unwrap();
-        } else {
-            writeln!(out, "  (this walk covers part of the filesystem, not compared)").unwrap();
+        label(out, "  in files under this path:", fs.walked);
+        if fs.outside_walk > 0 {
+            label(out, "  only in files outside it:", fs.outside_walk);
+        }
+        if fs.unreferenced > 0 {
+            label(out, "  in extents no file references:", fs.unreferenced);
+        }
+        if fs.unexplained != 0 {
+            let sign = if fs.unexplained < 0 { "-" } else { "" };
+            writeln!(
+                out,
+                "{:<40} {sign}{}",
+                "  unexplained:",
+                bytes(fs.unexplained.unsigned_abs(), human)
+            )
+            .unwrap();
         }
     }
 
@@ -241,13 +281,10 @@ pub fn report_to_text(out: &mut String, r: &Report, root: &Path, human: bool, ve
     }
 
     if r.counters.errors() > 0 {
-        writeln!(out, "\n{} errors, see the warnings above", r.counters.errors()).unwrap();
-    }
-    if r.counters.mappings_encoded > 0 {
         writeln!(
             out,
-            "\nnote: {} compressed extents; sizes are uncompressed",
-            r.counters.mappings_encoded
+            "\n{} errors, see the warnings above",
+            r.counters.errors()
         )
         .unwrap();
     }

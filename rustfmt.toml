@@ -1,5 +1,4 @@
-# Default settings, i.e. idiomatic rust, as bcachefs-tools
+# Default settings, i.e. idiomatic rust, as bcachefs-tools (whose alignment
+# thresholds need nightly rustfmt)
 edition = "2024"
 newline_style = "Unix"
-enum_discrim_align_threshold = 20
-struct_field_align_threshold = 20

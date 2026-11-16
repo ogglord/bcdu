@@ -1,7 +1,7 @@
 mod bcachefs;
+mod btree;
 mod counters;
 mod extents;
-mod fiemap;
 mod ioctl;
 mod report;
 mod walk;
@@ -12,11 +12,12 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
-use log::{info, warn};
-use rustix::fs::{AtFlags, CWD, Mode, OFlags, StatxAttributes, StatxFlags, openat, statx};
+use log::info;
+use rustix::fs::{CWD, Mode, OFlags, openat};
 
+use counters::Counters;
 use report::{Check, Filesystem, Report, Usage};
 
 #[derive(Parser, Debug)]
@@ -24,12 +25,12 @@ use report::{Check, Filesystem, Report, Usage};
     name = "bcdu",
     version,
     about = "What each folder really occupies on bcachefs",
-    long_about = "Walks a directory tree and reads every file's extents, \
-counting each extent once - so data shared between files by reflinks (cp \
---reflink, deduplicating importers) isn't counted again for every copy, as du \
-counts it. For each folder: total is what its files occupy, exclusive what \
-only its files reference (what deleting it would free), shared the rest, \
-apparent what du -b says. Run as root to read every file.",
+    long_about = "Walks a directory tree and reads bcachefs's extents and \
+reflink btrees, so data shared between files by reflinks (cp --reflink, \
+deduplicating importers) and hardlinks is counted once - du counts it again for \
+every copy. For each folder: total is what its files occupy, exclusive what only \
+its files hold (what deleting it would free), shared the rest, apparent what du \
+-b says. Needs root.",
     disable_help_flag = true
 )]
 struct Cli {
@@ -67,68 +68,106 @@ struct Cli {
     path: PathBuf,
 }
 
-fn raise_nofile_limit() {
-    use rustix::process::{Resource, getrlimit, setrlimit};
-    let mut lim = getrlimit(Resource::Nofile);
-    if lim.current < lim.maximum {
-        lim.current = lim.maximum;
-        let _ = setrlimit(Resource::Nofile, lim);
+struct Subvolume {
+    node: u32,
+    snapshot: bcachefs::SubvolSnapshot,
+}
+
+fn subvolumes(w: &walk::Walk) -> Result<HashMap<u64, Subvolume>> {
+    let mut out = HashMap::new();
+    for n in 0..w.nodes.len() as u32 {
+        let subvol = w.nodes[n as usize].subvol;
+        if subvol == 0 && w.counters.dirs > 0 && n == 0 {
+            bail!("the kernel doesn't report subvolumes (STATX_SUBVOL, Linux 6.10)");
+        }
+        if !report::is_subvol_root(w, n) {
+            continue;
+        }
+        let path = report::node_path(w, n);
+        let fd = openat(
+            CWD,
+            &path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .with_context(|| format!("opening '{}'", path.display()))?;
+        let snapshot = bcachefs::subvol_snapshot(&fd, subvol).with_context(|| {
+            format!("the snapshot of subvolume {subvol} at '{}'", path.display())
+        })?;
+        out.insert(subvol, Subvolume { node: n, snapshot });
     }
+    Ok(out)
 }
 
 fn bcdu(cli: Cli) -> Result<()> {
-    raise_nofile_limit();
-    let threads = cli.threads.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    let threads = cli
+        .threads
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
 
-    let root_fd = openat(CWD, &cli.path, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty())
-        .with_context(|| format!("opening '{}'", cli.path.display()))?;
-    let bcachefs = bcachefs::is_bcachefs(&root_fd)?;
-    if !bcachefs {
-        warn!(
-            "'{}' is not on bcachefs: extents are told apart by FIEMAP offsets alone, and nothing is compared",
-            cli.path.display()
-        );
+    let root_fd = openat(
+        CWD,
+        &cli.path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .with_context(|| format!("opening '{}'", cli.path.display()))?;
+    if !bcachefs::is_bcachefs(&root_fd)? {
+        bail!("'{}' is not on bcachefs", cli.path.display());
     }
 
     let t = Instant::now();
-    let mut w = walk::walk(&cli.path, threads)?;
-    info!("walk: {:.2?}, {} files, {} shared slices", t.elapsed(), w.files.len(), w.refs.len());
+    let mut reflink_counters = Counters::default();
+    let (indirect, w) = std::thread::scope(|s| {
+        let indirect = s.spawn(|| extents::read_indirect(&root_fd, &mut reflink_counters));
+        let w = walk::walk(&cli.path, threads);
+        (indirect.join().unwrap(), w)
+    });
+    let (indirect, mut w) = (indirect?, w?);
+    w.counters += &reflink_counters;
+    info!(
+        "walk and reflink btree: {:.2?}, {} files, {} indirect extents",
+        t.elapsed(),
+        w.files.len(),
+        indirect.len()
+    );
+
+    let subvols = subvolumes(&w)?;
+    let snapshots: HashMap<u32, u64> = subvols.iter().map(|(&id, s)| (s.snapshot.id, id)).collect();
 
     let t = Instant::now();
-    extents::resolve_single_ptr(&mut w.refs, &mut w.counters);
-    w.refs.sort_unstable_by_key(|r| (r.sig, r.start));
-    info!("resolve and sort: {:.2?}", t.elapsed());
+    let holders = extents::read_extents(&root_fd, &mut w, &snapshots, &indirect, threads)?;
+    info!(
+        "extents btree: {:.2?}, {} references",
+        t.elapsed(),
+        holders.files.len()
+    );
 
     let t = Instant::now();
-    let att = extents::attribute(&w.refs, &w.files, &w.links, &w.nodes, threads);
+    let att = extents::attribute(&w, &indirect, &holders, threads);
     let usage = Usage::new(&w, &att);
     info!("attribute: {:.2?}", t.elapsed());
 
-    let filesystem = if bcachefs {
-        let user = bcachefs::user_data(&root_fd)?;
-        let st = statx(&root_fd, c"", AtFlags::EMPTY_PATH, StatxFlags::BASIC_STATS)?;
-        let walked_from_root = st.stx_attributes_mask.contains(StatxAttributes::MOUNT_ROOT)
-            && st.stx_attributes.contains(StatxAttributes::MOUNT_ROOT);
-        Some(Filesystem {
-            user_data_one_copy: user.one_copy_bytes(),
-            user_data_raw: user.raw_bytes(),
-            replicas: user.replicas(),
-            walked_from_root,
-            found: usage.total[0],
-        })
-    } else {
-        None
+    let user = bcachefs::user_data(&root_fd)?;
+    let outside_walk = w.counters.bytes_outside_direct + att.outside_only;
+    let filesystem = Filesystem {
+        user_data_one_copy: user.one_copy_bytes(),
+        user_data_raw: user.raw_bytes(),
+        replicas: user.replicas(),
+        walked: usage.total[0],
+        outside_walk,
+        unreferenced: att.unreferenced,
+        unexplained: user.one_copy_bytes() as i64
+            - (usage.total[0] + outside_walk + att.unreferenced) as i64,
     };
 
-    let check = match (&filesystem, cli.check) {
-        (Some(fs), true) => Some(check(&w, fs)?),
-        (None, true) => anyhow::bail!("--check needs bcachefs"),
-        _ => None,
-    };
+    let check = cli
+        .check
+        .then(|| check(&w, &subvols, &filesystem))
+        .transpose()?;
 
     let r = Report {
         folders: report::folders(&w, &usage, cli.depth),
-        filesystem,
+        filesystem: Some(filesystem),
         check,
         counters: w.counters,
     };
@@ -144,33 +183,31 @@ fn bcdu(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-fn check(w: &walk::Walk, fs: &Filesystem) -> Result<Vec<Check>> {
-    let replicas = fs.replicas.context("--check: user data is stored with different replica counts")? as u64;
+fn check(w: &walk::Walk, subvols: &HashMap<u64, Subvolume>, fs: &Filesystem) -> Result<Vec<Check>> {
+    let replicas =
+        fs.replicas
+            .context("--check: user data is stored with different replica counts")? as u64;
 
     let mut direct: HashMap<u64, u64> = HashMap::new();
     for f in &w.files {
         *direct.entry(w.nodes[f.dir as usize].subvol).or_default() += f.direct;
     }
 
-    let mut out = Vec::new();
-    for n in 0..w.nodes.len() as u32 {
-        if !report::is_subvol_root(w, n) {
-            continue;
-        }
-        let path = report::node_path(w, n);
-        let subvol = w.nodes[n as usize].subvol;
-        let fd = openat(CWD, &path, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty())
-            .with_context(|| format!("opening '{}'", path.display()))?;
-        let raw = bcachefs::subvol_sectors(&fd, subvol).with_context(|| format!("subvolume {subvol}"))? << 9;
-        let bcdu_direct = direct.get(&subvol).copied().unwrap_or(0);
-        out.push(Check {
-            subvolume: subvol,
-            path,
-            bcachefs_bytes: raw / replicas,
-            bcdu_direct,
-            matches: raw == bcdu_direct * replicas,
-        });
-    }
+    let mut out: Vec<Check> = subvols
+        .iter()
+        .map(|(&subvol, s)| {
+            let raw = s.snapshot.sectors << 9;
+            let bcdu_direct = direct.get(&subvol).copied().unwrap_or(0);
+            Check {
+                subvolume: subvol,
+                path: report::node_path(w, s.node),
+                bcachefs_bytes: raw / replicas,
+                bcdu_direct,
+                matches: raw == bcdu_direct * replicas,
+            }
+        })
+        .collect();
+    out.sort_by_key(|c| c.subvolume);
     Ok(out)
 }
 
@@ -179,7 +216,14 @@ fn main() -> ExitCode {
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or(if cli.verbose { "info" } else { "warn" }),
     )
-    .format(|buf, rec| writeln!(buf, "{}: {}", rec.level().as_str().to_lowercase(), rec.args()))
+    .format(|buf, rec| {
+        writeln!(
+            buf,
+            "{}: {}",
+            rec.level().as_str().to_lowercase(),
+            rec.args()
+        )
+    })
     .init();
 
     match bcdu(cli) {

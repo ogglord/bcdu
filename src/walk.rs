@@ -1,18 +1,15 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::{CStr, CString, OsStr, OsString};
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 
 use anyhow::{Context, Result, bail};
 use log::warn;
-use rustix::fs::{AtFlags, CWD, Dir, FileType, Mode, OFlags, StatxFlags, fstat, openat, statx};
-use rustix::io::Errno;
+use rustix::fs::{AtFlags, CWD, Dir, FileType, Mode, OFlags, StatxFlags, openat, statx};
 
 use crate::counters::Counters;
-use crate::extents::SharedRef;
-use crate::fiemap::*;
 
 pub const NO_PARENT: u32 = u32::MAX;
 
@@ -20,42 +17,49 @@ pub const NO_PARENT: u32 = u32::MAX;
 const STATX_SUBVOL: u32 = 0x8000;
 
 pub struct Node {
-    pub name:   OsString,
+    pub name: OsString,
     pub parent: u32,
-    pub depth:  u32,
+    pub depth: u32,
     pub subvol: u64,
 }
 
 pub struct File {
-    pub dir:      u32,
+    pub dir: u32,
+    pub inode: u64,
     pub apparent: u64,
-    pub direct:   u64,
+    /// Bytes of extents only this file references, filled in from the
+    /// extents btree.
+    pub direct: u64,
 }
 
 pub struct Walk {
-    pub nodes:    Vec<Node>,
-    pub files:    Vec<File>,
-    pub refs:     Vec<SharedRef>,
-    /// A hardlinked file's other folders: all of its extents are shared
-    /// between every folder it has a name in.
-    pub links:    HashMap<u32, Vec<u32>>,
+    pub nodes: Vec<Node>,
+    pub files: Vec<File>,
+    /// A hardlinked file's other folders: its data is shared between every
+    /// folder it has a name in.
+    pub links: HashMap<u32, Vec<u32>>,
     pub counters: Counters,
 }
 
 // Files of a directory are handed out in batches so one huge directory is
 // spread over all the threads.
-const BATCH: usize = 64;
+const BATCH: usize = 256;
 
 struct DirCtx {
-    fd:     OwnedFd,
-    path:   PathBuf,
-    node:   u32,
-    subvol: u64,
+    fd: OwnedFd,
+    path: PathBuf,
+    node: u32,
 }
 
 enum Job {
-    Dir { path: PathBuf, node: u32 },
-    Files { dir: Arc<DirCtx>, names: Vec<CString> },
+    Dir {
+        path: PathBuf,
+        node: u32,
+    },
+    Files {
+        dir: Arc<DirCtx>,
+        names: Vec<CString>,
+    },
 }
 
 struct Queue {
@@ -64,11 +68,10 @@ struct Queue {
 }
 
 struct Shared {
-    queue:     Mutex<Queue>,
-    wake:      Condvar,
-    nodes:     Mutex<Vec<Node>>,
-    hardlinks: Mutex<HashSet<InodeKey>>,
-    dev:       (u32, u32),
+    queue: Mutex<Queue>,
+    wake: Condvar,
+    nodes: Mutex<Vec<Node>>,
+    dev: (u32, u32),
 }
 
 impl Shared {
@@ -112,21 +115,15 @@ impl Shared {
     }
 }
 
-type InodeKey = (u64, u64);
-
 #[derive(Default)]
 struct Found {
-    files:       Vec<File>,
-    refs:        Vec<SharedRef>,
-    first_names: Vec<(InodeKey, u32)>,
-    other_names: Vec<(InodeKey, u32)>,
-    counters:    Counters,
+    files: Vec<File>,
+    counters: Counters,
 }
 
 struct Worker<'a> {
     shared: &'a Shared,
-    reader: FiemapReader,
-    found:  Found,
+    found: Found,
 }
 
 pub fn walk(root: &Path, threads: usize) -> Result<Walk> {
@@ -137,26 +134,31 @@ pub fn walk(root: &Path, threads: usize) -> Result<Walk> {
     }
 
     let shared = Shared {
-        queue:     Mutex::new(Queue {
-            jobs: vec![Job::Dir { path: root.to_owned(), node: 0 }],
+        queue: Mutex::new(Queue {
+            jobs: vec![Job::Dir {
+                path: root.to_owned(),
+                node: 0,
+            }],
             busy: 0,
         }),
-        wake:      Condvar::new(),
-        nodes:     Mutex::new(vec![Node {
-            name:   root.as_os_str().to_owned(),
+        wake: Condvar::new(),
+        nodes: Mutex::new(vec![Node {
+            name: root.as_os_str().to_owned(),
             parent: NO_PARENT,
-            depth:  0,
+            depth: 0,
             subvol: 0,
         }]),
-        hardlinks: Mutex::new(HashSet::new()),
-        dev:       (st.stx_dev_major, st.stx_dev_minor),
+        dev: (st.stx_dev_major, st.stx_dev_minor),
     };
 
     let results: Vec<Found> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..threads)
             .map(|_| {
                 s.spawn(|| {
-                    let mut w = Worker { shared: &shared, reader: FiemapReader::new(), found: Found::default() };
+                    let mut w = Worker {
+                        shared: &shared,
+                        found: Found::default(),
+                    };
                     while let Some(job) = shared.pop() {
                         match job {
                             Job::Dir { path, node } => w.walk_dir(path, node),
@@ -168,7 +170,6 @@ pub fn walk(root: &Path, threads: usize) -> Result<Walk> {
                         }
                         shared.done();
                     }
-                    w.found.counters.fiemap_resumes = w.reader.resumes;
                     w.found
                 })
             })
@@ -176,45 +177,46 @@ pub fn walk(root: &Path, threads: usize) -> Result<Walk> {
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    let mut out = Walk {
-        nodes:    shared.nodes.into_inner().unwrap(),
-        files:    Vec::new(),
-        refs:     Vec::new(),
-        links:    HashMap::new(),
-        counters: Counters::default(),
-    };
-    out.files.reserve(results.iter().map(|f| f.files.len()).sum());
-    out.refs.reserve(results.iter().map(|f| f.refs.len()).sum());
-    let mut first_names = HashMap::new();
-    let mut other_names = Vec::new();
+    let nodes = shared.nodes.into_inner().unwrap();
+    let mut files = Vec::with_capacity(results.iter().map(|f| f.files.len()).sum());
+    let mut counters = Counters::default();
     for f in results {
-        let offset = u32::try_from(out.files.len()).expect("more than 2^32 files");
-        out.files.extend(f.files);
-        out.refs.extend(f.refs.into_iter().map(|r| SharedRef { file: r.file + offset, ..r }));
-        first_names.extend(f.first_names.into_iter().map(|(k, file)| (k, file + offset)));
-        other_names.extend(f.other_names);
-        out.counters += &f.counters;
+        files.extend(f.files);
+        counters += &f.counters;
     }
-    // a name whose first was never read (it failed to open) has nothing to share
-    for (k, dir) in other_names {
-        if let Some(&file) = first_names.get(&k) {
-            out.links.entry(file).or_default().push(dir);
+
+    // A hardlinked file is listed once per name; keep the first, and
+    // remember the folders of the rest.
+    let mut first: HashMap<(u64, u64), u32> = HashMap::with_capacity(files.len());
+    let mut links: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut kept = Vec::with_capacity(files.len());
+    for f in files {
+        let key = (nodes[f.dir as usize].subvol, f.inode);
+        match first.get(&key) {
+            Some(&i) => {
+                links.entry(i).or_default().push(f.dir);
+                counters.hardlinks_skipped += 1;
+            }
+            None => {
+                first.insert(key, kept.len() as u32);
+                kept.push(f);
+            }
         }
     }
-    Ok(out)
-}
+    u32::try_from(kept.len()).expect("more than 2^32 files");
+    counters.files = kept.len() as u64;
 
-fn open_noatime(dirfd: impl AsFd, name: &CStr, flags: OFlags) -> rustix::io::Result<OwnedFd> {
-    // O_NOATIME is refused with EPERM on files we don't own, without
-    // CAP_FOWNER: fall back to an ordinary open
-    match openat(&dirfd, name, flags | OFlags::NOATIME, Mode::empty()) {
-        Err(Errno::PERM) => openat(&dirfd, name, flags, Mode::empty()),
-        r => r,
-    }
+    Ok(Walk {
+        nodes,
+        files: kept,
+        links,
+        counters,
+    })
 }
 
 impl Worker<'_> {
     fn walk_dir(&mut self, path: PathBuf, node: u32) {
+        let c = &mut self.found.counters;
         let fd = match openat(
             CWD,
             &path,
@@ -223,37 +225,55 @@ impl Worker<'_> {
         ) {
             Ok(fd) => fd,
             Err(e) => {
-                warn!("opening directory '{}': {e} (skipped, counted under errors)", path.display());
-                self.found.counters.err_readdir += 1;
+                warn!(
+                    "opening directory '{}': {e} (skipped, counted under errors)",
+                    path.display()
+                );
+                c.err_readdir += 1;
                 return;
             }
         };
 
-        let st = match statx(&fd, c"", AtFlags::EMPTY_PATH, StatxFlags::from_bits_retain(STATX_SUBVOL)) {
+        let st = match statx(
+            &fd,
+            c"",
+            AtFlags::EMPTY_PATH,
+            StatxFlags::from_bits_retain(STATX_SUBVOL),
+        ) {
             Ok(st) => st,
             Err(e) => {
-                warn!("stat '{}': {e} (skipped, counted under errors)", path.display());
-                self.found.counters.err_stat += 1;
+                warn!(
+                    "stat '{}': {e} (skipped, counted under errors)",
+                    path.display()
+                );
+                c.err_stat += 1;
                 return;
             }
         };
         if (st.stx_dev_major, st.stx_dev_minor) != self.shared.dev {
-            self.found.counters.special += 1;
+            c.other_fs += 1;
             return;
         }
-        let subvol = if st.stx_mask & STATX_SUBVOL != 0 { st.stx_subvol } else { 0 };
-        self.shared.nodes.lock().unwrap()[node as usize].subvol = subvol;
-        self.found.counters.dirs += 1;
+        self.shared.nodes.lock().unwrap()[node as usize].subvol = if st.stx_mask & STATX_SUBVOL != 0
+        {
+            st.stx_subvol
+        } else {
+            0
+        };
+        c.dirs += 1;
 
-        let mut names = Vec::new();
         let mut dir = match Dir::read_from(&fd) {
             Ok(dir) => dir,
             Err(e) => {
-                warn!("reading directory '{}': {e} (skipped, counted under errors)", path.display());
-                self.found.counters.err_readdir += 1;
+                warn!(
+                    "reading directory '{}': {e} (skipped, counted under errors)",
+                    path.display()
+                );
+                c.err_readdir += 1;
                 return;
             }
         };
+        let mut names = Vec::new();
         while let Some(ent) = dir.read() {
             let ent = match ent {
                 Ok(ent) => ent,
@@ -262,7 +282,7 @@ impl Worker<'_> {
                         "reading directory '{}': {e} (the rest of it skipped, counted under errors)",
                         path.display()
                     );
-                    self.found.counters.err_readdir += 1;
+                    c.err_readdir += 1;
                     break;
                 }
             };
@@ -270,38 +290,28 @@ impl Worker<'_> {
             if name == c"." || name == c".." {
                 continue;
             }
-            let ft = match ent.file_type() {
-                FileType::Unknown => match statx(&fd, name, AtFlags::SYMLINK_NOFOLLOW, StatxFlags::TYPE) {
-                    Ok(st) => FileType::from_raw_mode(st.stx_mode.into()),
-                    Err(e) => {
-                        warn!(
-                            "stat '{}': {e} (skipped, counted under errors)",
-                            path.join(OsStr::from_bytes(name.to_bytes())).display()
-                        );
-                        self.found.counters.err_stat += 1;
-                        continue;
-                    }
-                },
-                ft => ft,
-            };
-            match ft {
+            match ent.file_type() {
                 FileType::Directory => {
                     let child = self.shared.add_node(name, node);
                     let path = path.join(OsStr::from_bytes(name.to_bytes()));
                     self.shared.push(Job::Dir { path, node: child });
                 }
-                FileType::RegularFile => names.push(name.to_owned()),
-                FileType::Symlink => self.found.counters.symlinks += 1,
-                _ => self.found.counters.special += 1,
+                // walk_file() stats it, and skips what isn't a file
+                FileType::RegularFile | FileType::Unknown => names.push(name.to_owned()),
+                FileType::Symlink => c.symlinks += 1,
+                _ => c.special += 1,
             }
         }
         drop(dir);
 
-        let dir = Arc::new(DirCtx { fd, path, node, subvol });
+        let dir = Arc::new(DirCtx { fd, path, node });
         let mut batches = names.chunks(BATCH);
         let first = batches.next();
         for batch in batches {
-            self.shared.push(Job::Files { dir: dir.clone(), names: batch.to_vec() });
+            self.shared.push(Job::Files {
+                dir: dir.clone(),
+                names: batch.to_vec(),
+            });
         }
         for name in first.into_iter().flatten() {
             self.walk_file(&dir, name);
@@ -309,104 +319,46 @@ impl Worker<'_> {
     }
 
     fn walk_file(&mut self, dir: &DirCtx, name: &CStr) {
-        let path = || dir.path.join(OsStr::from_bytes(name.to_bytes()));
-
-        let fd = match open_noatime(
+        let c = &mut self.found.counters;
+        let st = match statx(
             &dir.fd,
             name,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            AtFlags::SYMLINK_NOFOLLOW,
+            StatxFlags::TYPE | StatxFlags::INO | StatxFlags::SIZE,
         ) {
-            Ok(fd) => fd,
-            Err(e) => {
-                warn!("opening '{}': {e} (skipped, counted under errors)", path().display());
-                self.found.counters.err_open += 1;
-                return;
-            }
-        };
-        let st = match fstat(&fd) {
             Ok(st) => st,
             Err(e) => {
-                warn!("stat '{}': {e} (skipped, counted under errors)", path().display());
-                self.found.counters.err_stat += 1;
+                warn!(
+                    "stat '{}': {e} (skipped, counted under errors)",
+                    dir.path.join(OsStr::from_bytes(name.to_bytes())).display()
+                );
+                c.err_stat += 1;
                 return;
             }
         };
-        if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
-            // replaced since readdir
-            self.found.counters.special += 1;
-            return;
-        }
-        let inode = (st.st_nlink > 1).then_some((dir.subvol, st.st_ino));
-        if let Some(k) = inode {
-            if !self.shared.hardlinks.lock().unwrap().insert(k) {
-                self.found.other_names.push((k, dir.node));
-                self.found.counters.hardlinks_skipped += 1;
+        match FileType::from_raw_mode(st.stx_mode.into()) {
+            FileType::RegularFile => {}
+            FileType::Directory => {
+                // d_type was unknown, and it's a directory after all
+                let child = self.shared.add_node(name, dir.node);
+                let path = dir.path.join(OsStr::from_bytes(name.to_bytes()));
+                self.shared.push(Job::Dir { path, node: child });
                 return;
             }
-        }
-        self.found.counters.files += 1;
-
-        let file = u32::try_from(self.found.files.len()).expect("more than 2^32 files in one thread");
-        let mut direct = 0;
-        let Worker { reader, found: Found { refs, counters, .. }, .. } = self;
-        let r = reader.read(fd.as_fd(), |m| {
-            add_mapping(m, file, &mut direct, refs, counters);
-        });
-        if let Err(e) = r {
-            warn!(
-                "reading the extents of '{}': {e} (its extents so far counted, counted under errors)",
-                path().display()
-            );
-            self.found.counters.err_fiemap += 1;
-        }
-
-        if let Some(k) = inode {
-            self.found.first_names.push((k, file));
+            FileType::Symlink => {
+                c.symlinks += 1;
+                return;
+            }
+            _ => {
+                c.special += 1;
+                return;
+            }
         }
         self.found.files.push(File {
             dir: dir.node,
-            apparent: st.st_size as u64,
-            direct,
+            inode: st.stx_ino,
+            apparent: st.stx_size,
+            direct: 0,
         });
-    }
-}
-
-fn add_mapping(m: &Mapping<'_>, file: u32, direct: &mut u64, refs: &mut Vec<SharedRef>, c: &mut Counters) {
-    let f = m.flags;
-    if f & FIEMAP_EXTENT_DATA_INLINE != 0 {
-        c.mappings_inline += 1;
-        c.bytes_inline += m.length;
-    } else if f & FIEMAP_EXTENT_DELALLOC != 0 {
-        if f & FIEMAP_EXTENT_UNWRITTEN != 0 {
-            c.mappings_reserved += 1;
-            c.bytes_reserved += m.length;
-        } else {
-            c.mappings_delalloc += 1;
-            c.bytes_delalloc += m.length;
-        }
-    } else if f & FIEMAP_EXTENT_UNKNOWN != 0 {
-        c.mappings_unknown += 1;
-    } else {
-        if f & FIEMAP_EXTENT_UNWRITTEN != 0 {
-            c.mappings_unwritten += 1;
-        }
-        if f & FIEMAP_EXTENT_ENCODED != 0 {
-            c.mappings_encoded += 1;
-            c.bytes_encoded += m.length;
-        }
-        let aligned = m.length % 512 == 0 && m.ptrs.iter().all(|p| p.physical % 512 == 0);
-        if f & FIEMAP_EXTENT_SHARED != 0 && aligned {
-            c.mappings_shared += 1;
-            if m.ptrs.len() == 1 {
-                c.shared_single_ptr += 1;
-            }
-            refs.push(SharedRef::new(m, file));
-        } else {
-            if !aligned {
-                c.mappings_unaligned += 1;
-            }
-            c.mappings_direct += 1;
-            *direct += m.length;
-        }
     }
 }
