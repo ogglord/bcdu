@@ -1,0 +1,25 @@
+[package]
+name = "bcdu"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85.0"
+description = "What each folder really occupies on bcachefs, reflinks counted once"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ogglord/bcdu"
+readme = "README.md"
+keywords = ["bcachefs", "du", "reflink", "disk-usage"]
+categories = ["command-line-utilities", "filesystem"]
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive", "wrap_help"] }
+rustix = { version = "1.1", features = ["fs", "process", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = { version = "0.4", features = ["std"] }
+env_logger = { version = "0.11", default-features = false }
+
+[profile.release]
+debug = 2
+# a panic is a broken invariant: abort with the backtrace, never unwind past it
+panic = "abort"
